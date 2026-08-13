@@ -1,0 +1,418 @@
+TRAINING A TRANSFORMER IN PYTORCH - NOTES
+=============================================
+
+This covers train.py - taking the from-scratch transformer block built in
+embeddings.py (see notes.txt) and turning it into a real, TRAINABLE model
+using PyTorch. Matches the code in train.py.
+
+
+1. WHY SWITCH FROM NUMPY TO PYTORCH
+---------------------------------------
+Everything in embeddings.py used RANDOM, NEVER-UPDATED weights - nothing
+ever actually learned anything. To make it learn, you need:
+  1. A LOSS - a number measuring how wrong a prediction was.
+  2. GRADIENTS of that loss with respect to every single weight
+     (backpropagation - how much nudging each weight would help).
+  3. Nudge every weight a small step in the direction that reduces the
+     loss (gradient descent), repeated many times.
+
+Hand-deriving those gradients through everything already built (attention,
+multi-head combination, feed-forward, two residual+layer-norm steps)
+would be extremely tedious and error-prone - a long chain of derivatives.
+
+PYTORCH'S AUTOGRAD does this automatically: build the computation with
+torch.Tensor objects (inside an nn.Module) instead of numpy arrays, and
+PyTorch tracks every operation done to them. One call - loss.backward() -
+computes every gradient automatically. Exact same reason PyTorch was used
+instead of hand-rolling backprop for the CNN in the digit-classifier
+project.
+
+
+2. THE TOY CORPUS AND WHY MULTIPLE SENTENCES ARE NEEDED
+--------------------------------------------------------------
+"Corpus" = NLP term for "a collection of text." A single 4-word sentence
+(like embeddings.py used) isn't enough data for anything to meaningfully
+learn from - there's no repeated pattern. Used a small made-up corpus
+with overlapping structure instead:
+
+  sentences = [
+      "I like to code",
+      "I like to read",
+      "I like to run",
+      "the cat likes to sleep",
+      "the dog likes to run",
+      "she likes to code",
+      "he likes to read",
+      "they like to sleep",
+  ]
+
+Overlapping patterns ("I like to ___", "likes to ___") give the model
+something actually learnable, without needing thousands of real
+sentences.
+
+VOCAB BUILDING: same word2idx/idx2word pattern as embeddings.py, just
+built from ALL words across ALL sentences combined (using a set to loop
+over every sentence, adding every word) instead of just one sentence's
+words. Ended up with vocab_size = 14 unique words.
+
+
+3. NEXT-WORD PREDICTION TRAINING PAIRS (sliding window)
+--------------------------------------------------------------
+The actual training TASK: given a sequence of words, predict what word
+comes next. This turns training into a classification problem (same idea
+as MNIST digit classification, cross-entropy loss) - just "which word"
+instead of "which digit."
+
+For each sentence, slide a window across it to get MULTIPLE training
+examples out of one sentence, not just one:
+
+  "I like to code" ->
+    (["I"], "like")
+    (["I", "like"], "to")
+    (["I", "like", "to"], "code")
+
+Code:
+  training_pairs = []
+  for sentence in sentences:
+      words = sentence.split()
+      for i in range(1, len(words)):
+          input_words = words[:i]
+          target_word = words[i]
+          training_pairs.append((input_words, target_word))
+
+words[:i] grabs everything up to (not including) position i - as i
+increases you get longer and longer prefixes. target_word = words[i] is
+whatever comes right after that prefix. Result: 26 training pairs out of
+just 8 sentences.
+
+
+4. nn.EMBEDDING (replaces vector_embeddings + convert_word)
+-------------------------------------------------------------
+  word_embedding = torch.nn.Embedding(vocab_size, embedding_dim)
+  position_embedding = torch.nn.Embedding(max_sequence_length, embedding_dim)
+
+Same lookup-table idea as embeddings.py's manual version - internally
+still just a matrix you index into - but PyTorch wraps it so it's
+TRAINABLE (its rows get updated by autograd) and lookup is just calling
+it like a function: word_embedding(some_indices) returns those rows.
+
+WHY position_embedding HAS max_sequence_length ROWS (not each sentence's
+own length): with multiple sentences of DIFFERENT lengths, the table
+needs to be sized to the LONGEST one (max_sequence_length = 5 here, from
+the longest sentence). Shorter sentences simply use fewer of the rows -
+a 3-word sentence only ever looks up rows 0, 1, 2 and never touches rows
+3, 4. This doesn't "mess up" anything - same situation as word_embedding
+itself: not every sentence uses every vocab word either, unused rows just
+sit there unused for that particular sentence. A lookup table is sized to
+the MAXIMUM you'll ever need to look up; each individual use just grabs
+whichever subset applies to it.
+
+
+5. THE TransformerBlock nn.Module CLASS
+-------------------------------------------
+Same __init__ / forward pattern as any PyTorch model (e.g. the CNN).
+Direct translation of embeddings.py's manual numpy math into trainable
+PyTorch layers:
+
+  KEY TRANSLATION: instead of W_q = np.random.randn(...), use
+  nn.Linear(in_features, out_features, bias=False) - same idea (a matrix
+  that projects one size to another), but as a trainable layer instead of
+  a raw numpy array. Calling self.W_q(x) does what x @ W_q did before.
+  bias=False because the original W_q/W_k/W_v/W_o had no bias terms
+  (only the feed-forward layers did).
+
+  class TransformerBlock(torch.nn.Module):
+      def __init__(self, embedding_dim, num_heads):
+          super().__init__()
+          self.num_heads = num_heads
+          self.head_dim = embedding_dim // num_heads
+
+          self.W_q_layers = torch.nn.ModuleList([])
+          self.W_k_layers = torch.nn.ModuleList([])
+          self.W_v_layers = torch.nn.ModuleList([])
+          for i in range(self.num_heads):
+              self.W_q_layers.append(torch.nn.Linear(embedding_dim, self.head_dim, bias=False))
+              self.W_k_layers.append(torch.nn.Linear(embedding_dim, self.head_dim, bias=False))
+              self.W_v_layers.append(torch.nn.Linear(embedding_dim, self.head_dim, bias=False))
+
+          self.W_o = torch.nn.Linear(embedding_dim, embedding_dim, bias=False)
+
+          self.W1 = torch.nn.Linear(embedding_dim, embedding_dim * 4, bias=True)
+          self.W2 = torch.nn.Linear(embedding_dim * 4, embedding_dim, bias=True)
+
+          self.layerNorm1 = torch.nn.LayerNorm(embedding_dim)
+          self.layerNorm2 = torch.nn.LayerNorm(embedding_dim)
+
+WHY nn.ModuleList INSTEAD OF A PLAIN PYTHON LIST: nn.ModuleList can only
+hold a FLAT list of individual modules - it can't hold "a bundle of 3
+linear layers" as one slot. That's why there are THREE separate
+ModuleLists (one for all the W_q's, one for all the W_k's, one for all
+the W_v's) instead of trying to store head 0's (W_q, W_k, W_v) together
+as one item. Using a plain Python list instead of ModuleList would also
+be a problem - PyTorch wouldn't register those layers' parameters for
+training at all, they'd be invisible to the optimizer.
+
+W_o doesn't need a list - there's only ever ONE of it, so it's just a
+normal self.W_o attribute like any single layer.
+
+WHY TWO SEPARATE LayerNorms: each nn.LayerNorm has its own learnable
+gamma/beta parameters internally. Reusing the SAME LayerNorm for both the
+post-attention step and the post-feed-forward step would force them to
+share identical scale/shift behavior - but there's no reason those two
+different steps should need the same scaling. Each gets its own instance
+so each can learn whatever scale/shift actually helps for that specific
+spot.
+
+FORWARD METHOD:
+  def forward(self, x):
+      head_outputs = []
+      for i in range(self.num_heads):
+          Q = self.W_q_layers[i](x)
+          K = self.W_k_layers[i](x)
+          V = self.W_v_layers[i](x)
+
+          scores = (Q @ K.T) / (self.head_dim ** 0.5)
+          attention_weights = torch.softmax(scores, dim=-1)
+          output = attention_weights @ V
+          head_outputs.append(output)
+
+      multiple_head_embedding = torch.cat(head_outputs, dim=1)
+      attn_output = self.W_o(multiple_head_embedding)
+
+      x1 = self.layerNorm1(x + attn_output)
+      hidden = torch.relu(self.W1(x1))
+      ffn_output = self.W2(hidden)
+      x2 = self.layerNorm2(x1 + ffn_output)
+      return x2
+
+  - `x` is a GENERIC name, not "sentence_embeddings" - this block doesn't
+    need to know or care where its input comes from. Right now it's the
+    word+position embeddings, but if you stacked multiple blocks later,
+    block 2's input would be block 1's OUTPUT, not the original
+    embeddings. Same reasoning as why shape must stay
+    (sequence_length, embedding_dim) throughout - lets blocks chain.
+  - Q @ K.T, softmax, @ V - EXACT same math as embeddings.py, just using
+    torch.softmax(scores, dim=-1) instead of manual exp/sum/divide.
+    dim=-1 means the same thing axis=-1 did before.
+  - torch.cat(..., dim=1) is PyTorch's np.concatenate - dim instead of
+    axis, otherwise identical.
+
+WHY block(x) WORKS (NOT block.forward(x)): nn.Module defines a special
+__call__ method - writing block(x) (calling an object like a function)
+invokes that __call__, which does some internal PyTorch bookkeeping
+(hooks etc.) and THEN calls self.forward(x) for you. block(x) and
+block.forward(x) usually give the same numeric RESULT, but block(x) is
+the CORRECT way to do it - calling .forward() directly skips internal
+mechanics PyTorch relies on. Always call the module itself, never
+.forward() directly.
+
+
+6. predict_next_word - CHAINING EVERYTHING TOGETHER
+-------------------------------------------------------
+  def predict_next_word(input_words):
+      input_indices = torch.tensor([word2idx[word] for word in input_words])
+      word_vectors = word_embedding(input_indices)
+
+      positions = torch.arange(len(input_words))
+      position_vectors = position_embedding(positions)
+
+      x = word_vectors + position_vectors
+
+      block_output = block(x)
+      last_vector = block_output[-1]
+
+      logits = output_layer(last_vector)
+      return logits
+
+  - torch.tensor([...]) (LOWERCASE t) converts the list of word strings'
+    indices into a tensor. IMPORTANT BUG HIT: torch.Tensor(...)
+    (CAPITAL T) always creates a FLOAT tensor - but nn.Embedding requires
+    INTEGER indices ("row 2.0" doesn't make sense the way "row 2" does).
+    This caused a real RuntimeError. Fix: use lowercase torch.tensor(),
+    which correctly infers integer (long) dtype from a list of Python
+    ints automatically.
+  - word_embedding(input_indices) - nn.Embedding accepts a tensor of
+    indices directly and returns ALL their rows at once - replaces the
+    manual convert_word loop entirely, one call does the whole lookup.
+  - torch.arange(len(input_words)) generates [0, 1, 2, ...] - the
+    position indices for however many words are in THIS input.
+  - x = word_vectors + position_vectors - same elementwise addition as
+    embeddings.py, combining word identity + position.
+  - last_vector = block_output[-1] - WHY THE LAST ROW: attention lets
+    each word "see" everything before it (and itself), so the vector for
+    the LAST word has effectively absorbed information from the whole
+    sequence so far - the natural choice to base the next-word
+    prediction on.
+  - logits = output_layer(last_vector) - projects that single vector
+    from embedding_dim up to vocab_size scores, one score ("logit") per
+    possible next word. output_layer = torch.nn.Linear(embedding_dim,
+    vocab_size).
+
+WHY NOT JUST MULTIPLY BY A MATRIX OF ONES (instead of a learned
+nn.Linear) to get the right shape:
+  Say last_vector = [1, 2, 3, 4]. Multiplying by an all-ones matrix, every
+  output score computes the SAME sum (since every column is identical):
+    word 0 score = 1*1 + 2*1 + 3*1 + 4*1 = 10
+    word 1 score = 1*1 + 2*1 + 3*1 + 4*1 = 10
+    word 2 score = 1*1 + 2*1 + 3*1 + 4*1 = 10
+  EVERY word gets an IDENTICAL score, no matter what last_vector actually
+  contains - completely useless, no way to ever tell words apart.
+  Second problem: a fixed matrix (ones or otherwise) can't be adjusted by
+  training - nothing for gradient descent to nudge. The projection needs
+  to be BOTH (1) different across output positions, so different words
+  CAN get different scores, AND (2) learnable, so training can reshape it
+  toward giving the correct word the highest score. Random init +
+  nn.Linear satisfies both.
+
+IMPORTANT CLARIFICATION: last_vector itself does NOT contain
+"probabilities" - it's just an abstract embedding_dim-sized summary of
+the input. output_layer doesn't read a hidden probability out of it - it
+LEARNS, through training, a transformation that turns that abstract
+vector into good scores. Nothing meaningful exists until training shapes
+it.
+
+
+7. LOSS FUNCTION - HOW LOGITS GET COMPARED TO AN INDEX
+--------------------------------------------------------------
+  loss_fn = torch.nn.CrossEntropyLoss()
+
+Same loss used for MNIST digit classification. Takes raw logits (shape
+(vocab_size,)) and a target index, produces one number: how wrong was
+this prediction.
+
+HOW THE COMPARISON ACTUALLY WORKS (it's a lookup + score, not a direct
+comparison) - worked example, logits = [1.0, 3.0, 0.5], target_idx = 1:
+
+  Step 1 - internally applies softmax to logits (same softmax built by
+    hand before): [0.11, 0.72, 0.17].
+  Step 2 - uses target_idx to PICK OUT the probability at that one
+    position: position 1's probability, 0.72. This is the index's whole
+    job - selecting which single softmax'd probability represents "how
+    confident was the model in the ACTUALLY correct answer."
+  Step 3 - loss = -log(0.72) ~= 0.33. A SMALL number, because the model
+    assigned high confidence to the correct word.
+  If target_idx had instead been 0 (only 0.11 probability assigned):
+    loss = -log(0.11) ~= 2.2 - a BIG number, confidently wrong.
+
+  Pattern: high probability on the correct word -> small loss.
+           low probability on the correct word -> big loss.
+
+target_idx = torch.tensor(word2idx[target_word]) - a SCALAR tensor
+(0-dimensional, holding just one number), as opposed to logits which is
+1-dimensional (vocab_size numbers). CrossEntropyLoss expects exactly this
+pairing: one vector of scores, one scalar correct-answer index.
+
+WHY WRAP IN torch.tensor AT ALL: loss_fn operates on tensors, not plain
+Python values - logits is already a tensor (came out of the model), so
+target_idx needs to be a tensor too for loss_fn's internal math
+(indexing, log, etc.) to work using PyTorch's tensor operations. Doesn't
+need gradient tracking itself (it's a fixed correct answer, not something
+being learned) - torch.tensor() handles that correctly by default.
+
+
+8. OPTIMIZER - COLLECTING PARAMETERS ACROSS SEPARATE PIECES
+--------------------------------------------------------------
+  all_params = (
+      list(word_embedding.parameters())
+      + list(position_embedding.parameters())
+      + list(block.parameters())
+      + list(output_layer.parameters())
+  )
+  optimizer = torch.optim.Adam(all_params, lr=0.01)
+
+Unlike the CNN (one single nn.Module class), this model is split across
+FOUR separate pieces (word_embedding, position_embedding, block,
+output_layer) - not wrapped in one parent class. The optimizer needs to
+know about EVERY trainable parameter across all four, so their parameter
+lists get manually combined via list concatenation. Ended up with 19
+parameter tensors total.
+
+Adam = solid general-purpose optimizer choice. lr=0.01 = the step size
+for each weight update.
+
+
+9. THE TRAINING LOOP
+-------------------------
+  num_epochs = 100
+  for epoch in range(num_epochs):
+      total_loss = 0
+      for input_words, target_word in training_pairs:
+          optimizer.zero_grad()
+
+          logits = predict_next_word(input_words)
+          target_idx = torch.tensor(word2idx[target_word])
+          loss = loss_fn(logits, target_idx)
+
+          loss.backward()
+          optimizer.step()
+
+          total_loss += loss.item()
+
+      if epoch % 10 == 0:
+          print(f"epoch {epoch}, loss: {total_loss:.4f}")
+
+For every training pair: predict, compute loss, backpropagate, update
+weights. Repeated across all 26 pairs, then the whole thing repeated 100
+times (epochs) so the model sees every example many times, gradually
+improving on all of them simultaneously (since the same weights are
+shared across every example, not learned independently per example).
+
+  - optimizer.zero_grad() - PyTorch ACCUMULATES gradients by default
+    (adds new ones to old ones) rather than replacing them. Forgetting
+    this would incorrectly pile up gradients from previous examples.
+    Always clear before each new example.
+  - loss.backward() - autograd walks backward through every operation
+    that produced logits, computing the gradient of the loss with
+    respect to all 19 parameter tensors, automatically. This is the
+    entire reason PyTorch was used instead of numpy for this phase.
+  - optimizer.step() - uses those just-computed gradients to actually
+    nudge every weight slightly toward reducing the loss.
+
+
+10. RESULTS - WHAT THE NUMBERS ACTUALLY MEANT
+--------------------------------------------------
+Observed:
+  epoch 0,  loss: 66.2915
+  epoch 10, loss: 52.6915
+  ...
+  epoch 90, loss: 51.9737
+
+total_loss is a SUM across all 26 pairs, not an average. Dividing by 26:
+  started ~66.29/26 ~= 2.55 per example
+  ended   ~51.97/26 ~= 2.00 per example
+
+For context: with vocab_size=14, a completely untrained/random model
+would average about -log(1/14) ~= 2.64 loss per example (guessing
+uniformly at random). Started near that random baseline (makes sense -
+weights started random) and genuinely improved past it - real learning,
+not just noise. The fast drop in the first 10 epochs followed by a slow
+crawl afterward is a normal pattern for a tiny toy setup, not a sign
+anything's broken.
+
+CONCRETE CONFIRMATION (beyond just the loss number):
+  logits = predict_next_word(['I', 'like'])
+  predicted_idx = torch.argmax(logits).item()
+  print(idx2word[predicted_idx])   # -> 'to', correctly
+
+torch.argmax picks the index of the highest-scoring logit - the model's
+actual prediction. After training, this correctly predicted the real
+next word, confirming the whole pipeline (embeddings -> transformer
+block -> output layer -> loss -> backprop -> optimizer) genuinely works
+end to end, not just "the loss number went down."
+
+
+11. BUGS HIT DURING THIS BUILD (for reference)
+----------------------------------------------------
+  - torch.Tensor([...]) (capital T) used instead of torch.tensor(...)
+    (lowercase) for building index tensors -> real RuntimeError, since
+    nn.Embedding needs integer indices but capital-T always makes floats.
+  - output = self.W_o (forgot to actually CALL the layer on an input,
+    just assigned the Linear object itself) instead of
+    self.W_o(multiple_head_embedding) -> "cannot multiply a linear and a
+    tensor" error. nn.Linear layers are called like functions, not
+    multiplied with @ or *.
+  - Copy-paste slip: V = self.W_k_layers[i](x) instead of
+    self.W_v_layers[i](x) - reused the Key layer for Value by mistake.
+
+None of these were comprehension gaps - all quick, well-understood fixes
+once pointed out.

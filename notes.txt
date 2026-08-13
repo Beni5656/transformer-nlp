@@ -1,0 +1,453 @@
+TRANSFORMERS / ATTENTION - NOTES SO FAR
+=========================================
+
+This walks through everything covered so far, in order, with concrete
+numbers where it helps. Matches the code in embeddings.py.
+
+
+1. WHY WORDS NEED TO BECOME VECTORS
+------------------------------------
+Neural nets only work on numbers. So text has to become numbers somehow.
+
+The naive way is ONE-HOT ENCODING: give every word in your vocabulary a
+vector as long as the vocabulary itself, with a single 1 marking that
+word's position and 0s everywhere else.
+
+Problem: every word ends up EQUALLY far from every other word. "cat" and
+"dog" are just as "unrelated" as "cat" and "bicycle" - there's no notion
+of similarity at all.
+
+EMBEDDINGS fix this: each word gets a short, dense vector (e.g. 4 numbers
+instead of vocab-size numbers) whose VALUES are learned from data, such
+that words used in similar contexts end up close together in that vector
+space.
+
+
+2. THE EMBEDDING TABLE (vector_embeddings in the code)
+---------------------------------------------------------
+Mechanically, an embedding is just a lookup table: a matrix of shape
+(vocab_size, embedding_dim). "Embedding word #7" just means "grab row 7."
+
+In the code:
+  - word2idx / idx2word map each unique word to an integer index.
+  - vector_embeddings is that (vocab_size, embedding_dim) matrix, randomly
+    initialized (meaningless until trained on real data - we never
+    trained it, we just built the mechanism).
+  - convert_word(word) looks up word2idx[word], then returns that row of
+    vector_embeddings.
+
+IMPORTANT: this table stays FIXED throughout everything below. Nothing
+later in the pipeline changes vector_embeddings itself.
+
+
+3. THE SENTENCE MATRIX (sentence_embeddings in the code)
+-------------------------------------------------------------
+Different from the embedding table above. Built by looping over the
+sentence's words IN ORDER (not the deduplicated vocab set) and stacking
+each word's looked-up vector as a row.
+
+Shape: (sequence_length, embedding_dim) - one row per word IN THE
+SENTENCE (so a repeated word appears twice), in the order it appears.
+
+Row order = word order, purely because of how the loop is written (word 1
+becomes row 0, word 2 becomes row 1, etc). This is just bookkeeping - it
+does NOT mean the model itself understands order yet (see the note on
+positional encoding at the bottom).
+
+This matrix is what attention actually operates on.
+
+
+4. QUERIES, KEYS, VALUES (Q, K, V)
+------------------------------------
+Attention doesn't compare the raw sentence_embeddings vectors directly.
+Instead, each word's vector gets passed through THREE separate learned
+projections (three weight matrices: W_q, W_k, W_v), producing three
+different vectors for that same word:
+
+  QUERY  - "what am I looking for from other words?"
+  KEY    - "what do I advertise about myself, for others to match
+            against?"
+  VALUE  - "what information do I actually contribute if someone
+            attends to me?"
+
+ANALOGY (YouTube search):
+  Query = the text you type into the search bar
+  Key   = each video's title/tags (what it's labeled as, for matching)
+  Value = the actual video content (what you get back and watch)
+You compare your query against every video's KEY to find relevance, but
+what you actually get back and use is the VALUE, not the key.
+
+Sentence example: "The cat sat because it was tired."
+  - "it" has a Query roughly asking "what noun am I referring to?"
+  - "cat" has a Key roughly encoding "I'm a singular animal noun."
+  - Because "it"'s Query matches "cat"'s Key well, "it" attends strongly
+    to "cat", and pulls in "cat"'s VALUE (its actual content) to update
+    its own representation.
+
+IMPORTANT DISTINCTION: only QUERY is "trying to find" something. Key and
+Value don't search for anything - Key is what gets searched AGAINST,
+Value is what gets HANDED OVER once a match happens. Neither is active.
+
+Worked numeric example (why Value matters), same "cat"/"it" sentence,
+2 words for simplicity:
+  V["cat"] = [5, 2]     # "cat"'s actual content/information
+  V["it"]  = [0, 0]     # "it" alone barely carries any content - it's
+                         # just a pronoun
+
+  Say attention already computed that "it" attends 90% to "cat" and 10%
+  to itself (via Q.K + softmax, steps 5-6 below). Then:
+
+  output["it"] = 0.9 * V["cat"] + 0.1 * V["it"]
+               = 0.9 * [5, 2] + 0.1 * [0, 0]
+               = [4.5, 1.8]
+
+  Notice: "it"'s brand new vector now looks almost exactly like "cat"'s
+  Value vector. That's the whole point - Value is the actual content
+  that gets COPIED/TRANSFERRED into another word's representation once
+  that word is decided to be relevant. "it" isn't searching for
+  anything - it's RECEIVING "cat"'s content, because Query/Key decided
+  "cat" was 90% relevant to it.
+
+Mechanically:
+  W_q, W_k, W_v are each a matrix of shape (embedding_dim, embedding_dim)
+  (or (embedding_dim, head_dim) once multi-head is involved - see below),
+  randomly initialized, meaningless until trained.
+
+  Q = sentence_embeddings @ W_q
+  K = sentence_embeddings @ W_k
+  V = sentence_embeddings @ W_v
+
+  Each of Q, K, V comes out the same shape as sentence_embeddings - just
+  a different learned "view" of the same words.
+
+
+5. SCALED DOT-PRODUCT ATTENTION SCORES
+------------------------------------------
+  scores = (Q @ K.T) / sqrt(head_dim)
+
+Q @ K.T computes EVERY pairwise dot product between Q's rows and K's rows
+in one matrix multiplication. Result shape: (sequence_length,
+sequence_length).
+
+  scores[i][j] = word i's query dotted with word j's key
+               = "how much does word i care about word j"
+
+Dividing by sqrt(head_dim) (or sqrt(embedding_dim) before splitting into
+heads) just scales the numbers down so they don't get too large - large
+dot products push softmax (next step) into a very "peaked" region that's
+hard to learn from. This scaling is the "scaled" in "scaled dot-product
+attention."
+
+
+6. SOFTMAX (turning scores into weights that sum to 1)
+-----------------------------------------------------------
+  exp_scores = np.exp(scores)
+  row_sums = np.sum(exp_scores, axis=1, keepdims=True)
+  attention_weights = exp_scores / row_sums
+
+Worked concrete example with a small 2x2 scores matrix [[2, 1], [0, 4]]:
+
+  Step 1 - np.exp(scores): apply e^x to every number individually.
+    exp([[2, 1], [0, 4]]) = [[7.39, 2.72], [1, 54.6]]
+    (This makes everything positive and exaggerates the gap between big
+    and small scores.)
+
+  Step 2 - np.sum(exp_scores, axis=1, keepdims=True): add up each ROW
+    into one total.
+    axis=1 means "collapse the columns within each row" - it does NOT
+    reduce the number of rows. You still get one output per row, it's
+    just that each row's output is now a single number instead of two.
+    row 0: 7.39 + 2.72 = 10.11
+    row 1: 1 + 54.6 = 55.6
+    Result: [[10.11], [55.6]] - shape (2, 1): still 2 rows, 1 column.
+    keepdims=True keeps this as an actual (2,1) column (not a flat list)
+    so the next division lines up correctly.
+
+  Step 3 - divide: exp_scores / row_sums. NumPy automatically "stretches"
+    the (2,1) column to match every element in its row (this stretching
+    is called BROADCASTING) - so every number in row 0 gets divided by
+    10.11, every number in row 1 gets divided by 55.6.
+    row 0: [7.39/10.11, 2.72/10.11] = [0.731, 0.269]  -> sums to 1
+    row 1: [1/55.6, 54.6/55.6]      = [0.018, 0.982]  -> sums to 1
+
+  Each row is now a valid probability distribution (sums to exactly 1) -
+  "what fraction of my attention goes to each other word."
+
+COMMON BUG (I made this mistake while writing it): the denominator MUST
+be the sum of the EXPONENTIATED scores, not the raw scores. Summing raw
+scores gives rows that don't add up to 1, which breaks the whole idea of
+"weights that represent percentages."
+
+
+7. WEIGHTED SUM WITH V -> THE ACTUAL OUTPUT
+-----------------------------------------------
+  output = attention_weights @ V
+
+Worked example, 2 words, V = [[1, 0], [0, 1]], attention_weights =
+[[0.8, 0.2], [0.3, 0.7]]:
+
+  output row 0 = 0.8 * V[0] + 0.2 * V[1] = 0.8*[1,0] + 0.2*[0,1]
+               = [0.8, 0.2]
+  output row 1 = 0.3 * V[0] + 0.7 * V[1] = 0.3*[1,0] + 0.7*[0,1]
+               = [0.3, 0.7]
+
+For EACH word, take that word's row of attention_weights and use those
+numbers as percentages to blend together ALL the V rows. Matrix multiply
+just does this for every word at once instead of writing it out as
+separate lines.
+
+The result is a NEW matrix, same shape as the original sentence matrix,
+but now each row is a CONTEXT-AWARE vector - a blend of that word's own
+information plus relevant information pulled in from other words. This
+is the actual fix for the "bank" problem from the very start (river bank
+vs. bank account get different output vectors depending on their
+neighboring words).
+
+
+8. MULTI-HEAD ATTENTION
+---------------------------
+Problem with a single attention computation: it only learns ONE notion of
+"relevance," but language has multiple simultaneous kinds of relationships
+(e.g. coreference like "it" -> "cat", vs. grammatical structure). One
+computation has to average all of that into one scheme.
+
+Fix: instead of one W_q/W_k/W_v triplet, make several ("heads"). Each
+head is smaller - instead of projecting to the full embedding_dim, each
+head projects to head_dim = embedding_dim // num_heads. Each head runs
+the EXACT same pipeline (steps 4-7 above) completely independently, with
+its own randomly-initialized weights, so each head can specialize in
+different kinds of relationships during training.
+
+Why split the dimension instead of giving each head the full size:
+  1. Shape: after all heads run, their outputs get concatenated back
+     together. If each head used the full embedding_dim, concatenating
+     N heads would blow the size up to N * embedding_dim, requiring an
+     extra step to shrink it back down. Splitting up front means
+     concatenating N heads of size (embedding_dim / N) lands back
+     exactly at embedding_dim.
+  2. Cost: if every head used the full dimension, multi-head attention
+     would cost N times as much compute as single-head. Splitting keeps
+     the TOTAL cost across all heads roughly the same as one single big
+     head, while still getting the benefit of multiple specialized views.
+
+Code structure:
+  num_heads = 2
+  head_dim = embedding_dim // num_heads   # 4 // 2 = 2
+
+  head_outputs = []
+  for i in range(num_heads):
+      W_q, W_k, W_v = random matrices of shape (embedding_dim, head_dim)
+      Q, K, V = sentence_embeddings @ each of those
+      scores = (Q @ K.T) / sqrt(head_dim)      # note: sqrt(head_dim) now,
+                                                # not sqrt(embedding_dim),
+                                                # since Q/K are now smaller
+      attention_weights = softmax(scores)       # same as step 6
+      output = attention_weights @ V
+      head_outputs.append(output)
+
+  multi_head_output = np.concatenate(head_outputs, axis=1)  # back to
+                                                              # (seq_len,
+                                                              # embedding_dim)
+  W_o = random matrix (embedding_dim, embedding_dim)
+  final_output = multi_head_output @ W_o   # lets info from different
+                                            # heads mix together
+
+WHY W_o IS NEEDED (concatenation alone isn't enough):
+  Concatenation just staples the heads' outputs side by side. If one
+  word's concatenated vector is [1, 2, 3, 4], where [1, 2] came from
+  Head 1 and [3, 4] came from Head 2, those stay in completely separate,
+  untouched chunks forever - position 0 only ever holds Head 1's info,
+  position 2 only ever holds Head 2's info. Nothing about Head 1's
+  finding ever touches Head 2's finding.
+
+  Multiplying by W_o fixes that: matrix multiplication makes every NEW
+  number a weighted combination of ALL the input numbers. E.g. the new
+  value at position 0 might be computed as 0.5*1 + 0.5*2 + 0.5*3 + 0.5*4
+  = 5 - a single number that now depends on both heads' contributions,
+  not just one. Do this for every position, and the final vector has
+  both heads' information genuinely blended together, not just sitting
+  in separate untouched halves.
+
+  Analogy: concatenation = stapling two people's separate notes together
+  (Head 1 writes about grammar, Head 2 writes about meaning - you now
+  have both, but as two unmixed documents). W_o = rewriting them into
+  one new note that actually combines ideas from both.
+
+embedding_dim = 4 and num_heads = 2 were both ARBITRARY choices, picked
+just to keep the numbers small enough to work through by hand. Real
+transformers use much bigger numbers (embedding_dim/d_model of 512-4096+,
+8-16+ heads), but the mechanism is identical.
+
+
+9. POSITIONAL ENCODING (position_embeddings in the code)
+-------------------------------------------------------------
+Attention as built above is actually "blind" to word order - the
+score/softmax/weighted-sum math would produce the same results (just
+relabeled) if you shuffled the words around. Row order in the sentence
+matrix is just bookkeeping, not something attention itself uses.
+
+FIX: give each POSITION (not each word) its own learned vector, the same
+way vocab words each get their own learned vector - then add it directly
+into the word's embedding before attention ever sees it.
+
+  position_embeddings = np.random.randn(sequence_length, embedding_dim)
+  sentence_embeddings += position_embeddings   # elementwise, same shape
+
+Why a full vector per position instead of just using the raw index number
+(0, 1, 2, 3) directly:
+  1. Shape mismatch: each word's vector has embedding_dim numbers. A raw
+     index is just 1 number - can't meaningfully combine "1 number" with
+     "4 numbers" the way you can add two same-shaped vectors.
+  2. Even if you broadcast the single index number across all dimensions,
+     every dimension would shift by the exact same amount - no ability
+     for position to affect different dimensions differently. A full
+     learned vector lets position push different dimensions in different
+     ways, whatever pattern turns out useful during training.
+
+The index IS still used - it's what picks WHICH ROW of
+position_embeddings to grab (exactly the same job word2idx does for
+vector_embeddings). The row's CONTENT is a full learned vector, not the
+index number itself.
+
+Why ADDING (not concatenating or anything else) works: it makes each
+word's FINAL vector depend on both "what word is this" and "where is
+it," in the same numbers attention will compare. Even two identical
+words at different positions now end up with different final vectors
+(different position vectors got added), so attention can actually tell
+them apart.
+
+Honest caveat: since position_embeddings is untrained random noise right
+now, this doesn't mean anything sensible YET. This step builds the
+correct MECHANISM (the right shape and flow of information) - a real
+trained model would gradually shape those random numbers into a useful
+pattern (e.g. nearby positions ending up with similar vectors).
+
+
+10. THE FEED-FORWARD LAYER (after attention, per word independently)
+-------------------------------------------------------------------------
+After attention (steps 4-8) produces context-aware vectors, each word's
+vector is passed through a small neural net, applied to EACH WORD
+INDEPENDENTLY (no mixing across words this time - that's attention's job,
+not this step's):
+
+  FFN(x) = ReLU(x @ W1 + b1) @ W2 + b2
+
+  hidden_dim = embedding_dim * 4        # 4 * 4 = 16 - expand
+  W1 = random (embedding_dim, hidden_dim)     # (4, 16)
+  b1 = random (hidden_dim,)                   # (16,)
+  hidden = np.maximum(0, x @ W1 + b1)         # ReLU = max(0, x)
+  W2 = random (hidden_dim, embedding_dim)     # (16, 4)
+  b2 = random (embedding_dim,)                # (4,)
+  ffn_output = hidden @ W2 + b2               # shrink back to (4, 4)
+
+WHY THIS ACTUALLY HELPS (the "is this just made bigger for no reason"
+question):
+  Key fact: WITHOUT the ReLU in between, stacking two linear layers is
+  mathematically pointless - it collapses into ONE linear layer no matter
+  how big hidden_dim is. (x @ W1) @ W2 is the same as x @ (W1 @ W2) - just
+  one combined matrix. So without ReLU, expanding to 16 and shrinking
+  back to 4 would be a total waste of computation.
+
+  ReLU breaks that collapse. With a non-linear function in between, the
+  two layers together can represent things a single linear layer
+  fundamentally CANNOT - curves, thresholds, "if X then Y, otherwise Z"
+  type patterns. This is the exact same reason an MLP (hidden layers +
+  non-linear activation) can learn curved decision boundaries while plain
+  logistic regression (no hidden layer, no non-linearity) can only draw a
+  straight line - directly comparable to the digit-classifier project's
+  logistic-regression-vs-MLPClassifier comparison.
+
+  The extra WIDTH (hidden_dim=16 instead of staying at 4) gives that
+  non-linear step more distinct "slots" to detect different patterns in,
+  before ReLU decides which ones matter and it gets compressed back down
+  - same idea as a wider hidden layer in an MLP being able to represent
+  more distinct learned features at once.
+
+  Bottom line: ReLU is what makes this step more powerful than a single
+  linear step at all; the extra hidden_dim width just gives that
+  non-linear step more room to work with.
+
+
+11. RESIDUAL CONNECTIONS + LAYER NORM (wraps around each of the two
+    steps above: attention, and the feed-forward layer)
+-------------------------------------------------------------------------
+"Sublayer" just means "one step" - attention is one sublayer, the
+feed-forward layer is the other. Not a new concept, just a label for
+"whichever one of the two main steps we're talking about."
+
+RESIDUAL CONNECTION: instead of a step's output replacing what went into
+it, ADD the step's output back onto its own input:
+
+  output = input + Sublayer(input)
+
+Worked example: input x = [1, 2, 3, 4] goes into attention, attention
+outputs [0.5, 0.5, 0.5, 0.5]. WITHOUT a residual connection, you'd throw
+away x and just keep [0.5, 0.5, 0.5, 0.5] - fully replaced. WITH a
+residual connection: new_x = x + output = [1.5, 2.5, 3.5, 4.5] - keeps
+the original info AND adds whatever new thing the step contributed.
+
+Why: when many of these steps get stacked back to back (real
+transformers stack many blocks deep), if each step fully replaces the
+vector, small mistakes/lost information pile up across steps. Adding the
+input back each time is like taping new notes on top of the original
+page instead of erasing and rewriting it - nothing gets lost, only added
+to. Also makes deep networks much easier to train (gradients get a
+direct shortcut path back through the network).
+
+LAYER NORM: applied right after each residual add. For EACH WORD'S VECTOR
+INDEPENDENTLY (not across the whole matrix, not across words - just that
+one row's own numbers), rescale to have mean 0 and a consistent spread:
+
+  def layer_norm(x, gamma, beta):
+      mean = np.mean(x, axis=-1, keepdims=True)
+      var = np.var(x, axis=-1, keepdims=True)
+      normalized = (x - mean) / np.sqrt(var + 1e-5)
+      return gamma * normalized + beta
+
+  - axis=-1 means "the last axis" - for a 2D (seq_len, embedding_dim)
+    matrix, that's the same as axis=1 (the embedding_dim axis - the one
+    you did rowwise sums over for softmax). Written as -1 instead of a
+    hardcoded 1 so the same code still correctly targets "the embedding
+    dimension" even if a batch dimension gets added later
+    ((batch, seq_len, embedding_dim) - there axis=1 would wrongly mean
+    seq_len, but axis=-1 still means embedding_dim).
+  - mean/var computed PER ROW (per word), giving one mean and one
+    variance per word, not one for the whole matrix.
+  - (x - mean) centers each row around 0.
+  - dividing by sqrt(var + 1e-5) rescales to a consistent spread
+    (standard deviation). The +1e-5 just avoids ever dividing by exactly
+    0.
+  - gamma (scale) and beta (shift) are learned parameters, same role as
+    a weight and a bias anywhere else in a network. Starting at
+    gamma=ones, beta=zeros means "don't change anything yet" (multiply
+    by 1, add 0 = untouched) - training could adjust these away from
+    that if it helps.
+
+Why layer norm at all: as vectors pass through many stacked steps, their
+scale can drift wildly from step to step, which makes training unstable.
+Renormalizing after every step keeps things in a consistent, predictable
+range through the whole stack.
+
+FULL BLOCK, put together:
+  x1 = layer_norm(sentence_embeddings + final_output, gamma1, beta1)
+  hidden = np.maximum(0, x1 @ W1 + b1)      # feed-forward now uses x1,
+  ffn_output = hidden @ W2 + b2             # NOT final_output directly
+  x2 = layer_norm(x1 + ffn_output, gamma2, beta2)
+
+x2 is the final output of one complete transformer block.
+
+WHY THE SHAPE HAS TO STAY (sequence_length, embedding_dim) THE WHOLE WAY
+THROUGH:
+  1. Residual adds require matching shapes - sentence_embeddings +
+     final_output only works if they're literally the same shape.
+  2. Real transformers stack MANY blocks - one block's output becomes the
+     next block's input. If the shape changed inside a block, you
+     couldn't chain blocks together without extra reshaping every time.
+
+
+12. WHAT'S STILL MISSING (not built yet)
+--------------------------------------------
+  - STACKING BLOCKS + TRAINING: putting multiple transformer blocks
+    together and actually training on real data (likely switching from
+    raw numpy to PyTorch for this part, so backprop is handled
+    automatically).
